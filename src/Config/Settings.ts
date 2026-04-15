@@ -17,6 +17,7 @@ import { DebugSettings } from './DebugSettings';
 import { StatusSettings } from './StatusSettings';
 import { Feature } from './Feature';
 import type { FeatureFlag } from './Feature';
+import { type PlannerSettings, DEFAULT_PLANNER_SETTINGS } from '../Planner/PlannerSettings';
 
 interface SettingsMap {
     [key: string]: string | boolean;
@@ -95,6 +96,9 @@ export interface Settings {
     debugSettings: DebugSettings;
 
     loggingOptions: LogOptions;
+
+    // Microsoft Planner integration
+    plannerSettings: PlannerSettings;
 }
 
 const defaultSettings: Readonly<Settings> = {
@@ -148,6 +152,7 @@ const defaultSettings: Readonly<Settings> = {
             'tasks.Task': 'info', // Task.ts
         },
     },
+    plannerSettings: { ...DEFAULT_PLANNER_SETTINGS },
 };
 
 let settings: Settings = { ...defaultSettings };
@@ -192,6 +197,14 @@ export const getSettings = (): Settings => {
 export const updateSettings = (newSettings: Partial<Settings>): Settings => {
     // Apply migrations before updating settings
     const migratedSettings = migrateSettings(newSettings);
+
+    // Deep-merge plannerSettings so a partial patch doesn't wipe unrelated fields
+    if (migratedSettings.plannerSettings) {
+        migratedSettings.plannerSettings = {
+            ...settings.plannerSettings,
+            ...migratedSettings.plannerSettings,
+        };
+    }
 
     settings = { ...settings, ...migratedSettings };
 

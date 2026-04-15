@@ -22,6 +22,11 @@ import { StatusSettings } from './StatusSettings';
 import { CustomStatusModal } from './CustomStatusModal';
 import { GlobalQuery } from './GlobalQuery';
 import { PresetsSettingsUI } from './PresetsSettingsUI';
+import { PlannerAuth } from '../Planner/PlannerAuth';
+import type { PlannerSyncManager } from '../Planner/PlannerSyncManager';
+import type { PlannerBucket, PlannerPlan } from '../Planner/PlannerApiClient';
+import type { PlannerPriority, TagBucketMapping } from '../Planner/PlannerSettings';
+import { Priority } from '../Task/Priority';
 
 export class SettingsTab extends PluginSettingTab {
     // If the UI needs a more complex setting you can create a
@@ -35,6 +40,10 @@ export class SettingsTab extends PluginSettingTab {
     private readonly plugin: TasksPlugin;
     private readonly presetsSettingsUI;
     private readonly events: TasksEvents;
+    private plannerSyncManager: PlannerSyncManager | null = null;
+
+    /** AbortController for an in-progress device code authentication poll. */
+    private authAbortController: AbortController | null = null;
 
     constructor({ plugin, events }: { plugin: TasksPlugin; events: TasksEvents }) {
         super(plugin.app, plugin);
@@ -42,6 +51,11 @@ export class SettingsTab extends PluginSettingTab {
         this.plugin = plugin;
         this.presetsSettingsUI = new PresetsSettingsUI(plugin, events);
         this.events = events;
+    }
+
+    /** Called from main.ts once PlannerSyncManager is initialised. */
+    setPlannerSyncManager(manager: PlannerSyncManager): void {
+        this.plannerSyncManager = manager;
     }
 
     private static createFragmentWithHTML = (html: string) =>
@@ -540,6 +554,691 @@ export class SettingsTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 });
             });
+
+        // ---------------------------------------------------------------------------
+        new Setting(containerEl).setName('Microsoft Planner Integration').setHeading();
+        // ---------------------------------------------------------------------------
+
+        this.renderPlannerSettings(containerEl);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Microsoft Planner settings section
+    // ---------------------------------------------------------------------------
+
+    private renderPlannerSettings(containerEl: HTMLElement): void {
+        const ps = getSettings().plannerSettings;
+
+        // -- Enable/disable toggle --
+        new Setting(containerEl)
+            .setName('Enable Planner sync')
+            .setDesc('Sync Obsidian tasks with Microsoft Planner.')
+            .addToggle((toggle) => {
+                toggle.setValue(ps.enabled).onChange(async (value) => {
+                    updateSettings({ plannerSettings: { ...getSettings().plannerSettings, enabled: value } });
+                    await this.plugin.saveSettings();
+                    // Refresh to show/hide remaining fields
+                    this.display();
+                });
+            });
+
+        if (!ps.enabled) return;
+
+        // -- Azure AD credentials --
+        const setupHint = containerEl.createEl('p', {});
+        setupHint.style.cssText = 'font-size:0.85em; color:var(--text-muted); margin:0 0 12px; padding:8px 12px; border-left:3px solid var(--interactive-accent);';
+        setupHint.innerHTML =
+            '<strong>Azure AD app setup checklist:</strong><br>' +
+            '1. Register an app in <a href="https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps" target="_blank">Azure Portal → App registrations</a><br>' +
+            '2. Under <strong>Authentication</strong> → <em>Advanced settings</em>: set <strong>"Allow public client flows" → Yes</strong><br>' +
+            '3. Under <strong>API permissions</strong>: add <code>Tasks.ReadWrite</code> and <code>User.Read</code> (Microsoft Graph, Delegated)<br>' +
+            '4. Copy the Tenant ID and Client ID from the app <strong>Overview</strong> page into the fields below.';
+
+        new Setting(containerEl)
+            .setName('Tenant ID')
+            .setDesc(
+                'The Directory (tenant) ID from your Azure AD app registration. ' +
+                    'Found under Azure Portal → App registrations → your app → Overview.',
+            )
+            .addText((text) => {
+                text.setPlaceholder('xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx')
+                    .setValue(ps.tenantId)
+                    .onChange(
+                        debounce(async (value) => {
+                            updateSettings({
+                                plannerSettings: { ...getSettings().plannerSettings, tenantId: value.trim() },
+                            });
+                            await this.plugin.saveSettings();
+                        }, 500, true),
+                    );
+            });
+
+        new Setting(containerEl)
+            .setName('Client (Application) ID')
+            .setDesc('The Application (client) ID from your Azure AD app registration.')
+            .addText((text) => {
+                text.setPlaceholder('xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx')
+                    .setValue(ps.clientId)
+                    .onChange(
+                        debounce(async (value) => {
+                            updateSettings({
+                                plannerSettings: { ...getSettings().plannerSettings, clientId: value.trim() },
+                            });
+                            await this.plugin.saveSettings();
+                        }, 500, true),
+                    );
+            });
+
+        // -- Authentication --
+        const authStatusEl = containerEl.createEl('p', {
+            cls: 'setting-item-description',
+            text: ps.userDisplayName
+                ? `Authenticated as: ${ps.userDisplayName}`
+                : 'Not authenticated.',
+        });
+
+        const authSetting = new Setting(containerEl).setName('Authentication').setDesc('');
+
+        let cancelBtnEl: HTMLElement | null = null;
+
+        authSetting.addButton((btn) => {
+            btn.setButtonText(ps.userDisplayName ? 'Re-authenticate' : 'Authenticate')
+                .setCta()
+                .onClick(async () => {
+                    // Disable auth button and add Cancel inline — no full re-render
+                    btn.setDisabled(true);
+                    btn.setButtonText('Authenticating…');
+
+                    if (!cancelBtnEl) {
+                        authSetting.addButton((cancelBtn) => {
+                            cancelBtn.setButtonText('Cancel').setWarning().onClick(() => {
+                                this.authAbortController?.abort();
+                                this.authAbortController = null;
+                                authStatusEl.textContent = 'Authentication cancelled.';
+                                btn.setDisabled(false);
+                                btn.setButtonText(ps.userDisplayName ? 'Re-authenticate' : 'Authenticate');
+                                cancelBtnEl?.remove();
+                                cancelBtnEl = null;
+                            });
+                            cancelBtnEl = cancelBtn.buttonEl;
+                        });
+                    }
+
+                    await this.startPlannerAuth(authStatusEl, () => {
+                        // cleanup: remove cancel button, re-enable auth button
+                        cancelBtnEl?.remove();
+                        cancelBtnEl = null;
+                    });
+                });
+        });
+
+        if (!PlannerAuth.isAuthenticated(ps)) return;
+
+        // -- Default plan & bucket --
+        new Setting(containerEl)
+            .setName('Default plan')
+            .setDesc('Tasks with no matching tag are added to this plan. Usually "Private Tasks" for personal tasks.');
+
+        this.renderPlanDropdown(containerEl, 'Default plan', ps.defaultPlanId, async (plan) => {
+            updateSettings({
+                plannerSettings: {
+                    ...getSettings().plannerSettings,
+                    defaultPlanId: plan.id,
+                    defaultPlanTitle: plan.title,
+                    defaultBucketId: '',
+                    defaultBucketTitle: '',
+                },
+            });
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        if (ps.defaultPlanId) {
+            this.renderBucketDropdown(
+                containerEl,
+                'Default bucket',
+                ps.defaultPlanId,
+                ps.defaultBucketId,
+                async (bucket) => {
+                    updateSettings({
+                        plannerSettings: {
+                            ...getSettings().plannerSettings,
+                            defaultBucketId: bucket.id,
+                            defaultBucketTitle: bucket.name,
+                        },
+                    });
+                    await this.plugin.saveSettings();
+                    this.display(); // refresh so watched-buckets list excludes the new default
+                },
+            );
+
+            this.renderWatchedBucketsSection(containerEl, ps.defaultPlanId);
+        }
+
+        // -- Tag → bucket mappings --
+        new Setting(containerEl).setName('Tag to bucket mappings').setHeading();
+
+        new Setting(containerEl)
+            .setName('')
+            .setDesc(
+                'By default every task goes to the default bucket. ' +
+                    'Add a #tag to a task to send it to a different bucket instead. ' +
+                    'The first matching tag wins.',
+            );
+
+        this.renderTagMappingRows(containerEl, ps.tagMappings, ps.defaultPlanId, ps.defaultPlanTitle);
+
+        new Setting(containerEl).addButton((btn) => {
+            btn.setButtonText('+ Add mapping').onClick(async () => {
+                const current = getSettings().plannerSettings;
+                updateSettings({
+                    plannerSettings: {
+                        ...current,
+                        tagMappings: [
+                            ...current.tagMappings,
+                            {
+                                tag: '',
+                                planId: current.defaultPlanId,
+                                planTitle: current.defaultPlanTitle,
+                                bucketId: '',
+                                bucketTitle: '',
+                            },
+                        ],
+                    },
+                });
+                await this.plugin.saveSettings();
+                this.display();
+            });
+        });
+
+        // -- Priority mapping --
+        new Setting(containerEl).setName('Priority mapping').setHeading();
+        new Setting(containerEl)
+            .setName('')
+            .setDesc(
+                'Map each Obsidian priority to a Planner priority. ' +
+                    'Planner values: 0 = Urgent, 1 = Important, 5 = Medium, 9 = Low.',
+            );
+
+        const priorityKeys: Array<{ label: string; key: keyof typeof ps.priorityMapping }> = [
+            { label: 'Highest 🔺', key: 'highest' },
+            { label: 'High ⏫', key: 'high' },
+            { label: 'Medium 🔼', key: 'medium' },
+            { label: 'None (normal)', key: 'none' },
+            { label: 'Low 🔽', key: 'low' },
+            { label: 'Lowest ⏬', key: 'lowest' },
+        ];
+
+        for (const { label, key } of priorityKeys) {
+            new Setting(containerEl).setName(label).addDropdown((dd) => {
+                dd.addOption('0', '0 — Urgent');
+                dd.addOption('1', '1 — Important');
+                dd.addOption('5', '5 — Medium');
+                dd.addOption('9', '9 — Low');
+                dd.setValue(String(ps.priorityMapping[key]));
+                dd.onChange(async (value) => {
+                    const current = getSettings().plannerSettings;
+                    updateSettings({
+                        plannerSettings: {
+                            ...current,
+                            priorityMapping: {
+                                ...current.priorityMapping,
+                                [key]: Number(value) as PlannerPriority,
+                            },
+                        },
+                    });
+                    await this.plugin.saveSettings();
+                });
+            });
+        }
+
+        // -- Sync behaviour --
+        new Setting(containerEl).setName('Sync behaviour').setHeading();
+
+        new Setting(containerEl)
+            .setName('Auto-assign task IDs')
+            .setDesc(
+                'Automatically add a 🆔 identifier to new tasks so they can be stably tracked ' +
+                    'and synced with Planner.',
+            )
+            .addToggle((toggle) => {
+                toggle.setValue(ps.autoAssignTaskIds).onChange(async (value) => {
+                    updateSettings({
+                        plannerSettings: { ...getSettings().plannerSettings, autoAssignTaskIds: value },
+                    });
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        new Setting(containerEl)
+            .setName('Sync on file open')
+            .setDesc('Pull Planner task changes when you open a file that contains linked tasks.')
+            .addToggle((toggle) => {
+                toggle.setValue(ps.syncOnFileOpen).onChange(async (value) => {
+                    updateSettings({
+                        plannerSettings: { ...getSettings().plannerSettings, syncOnFileOpen: value },
+                    });
+                    await this.plugin.saveSettings();
+                });
+            });
+
+        new Setting(containerEl)
+            .setName('Background sync interval (minutes)')
+            .setDesc('Pull changes from Planner while the active file is open. Set to 0 to disable.')
+            .addSlider((slider) => {
+                slider
+                    .setLimits(0, 60, 1)
+                    .setValue(ps.syncIntervalMinutes)
+                    .setDynamicTooltip()
+                    .onChange(async (value) => {
+                        updateSettings({
+                            plannerSettings: { ...getSettings().plannerSettings, syncIntervalMinutes: value },
+                        });
+                        await this.plugin.saveSettings();
+                        this.plannerSyncManager?.startSyncInterval();
+                    });
+            });
+
+        // -------------------------------------------------------------------
+        // Import wizard
+        // -------------------------------------------------------------------
+
+        containerEl.createEl('h3', { text: 'Import from Planner' });
+
+        const importDesc = containerEl.createEl('p', {});
+        importDesc.style.cssText = 'font-size:0.85em; color:var(--text-muted); margin:0 0 12px;';
+        importDesc.textContent =
+            'Fetch active tasks from a Planner plan and append them to a vault file. Already-linked tasks are skipped.';
+
+        // State
+        let importPlanId = '';
+        let importBucketId = '';
+        let importBuckets: PlannerBucket[] = [];
+        let importTargetPath = 'Planner Tasks.md';
+
+        // Result status paragraph — declared early so async callbacks can reference it
+        const importStatusEl = containerEl.createEl('p', {});
+        importStatusEl.style.cssText = 'font-size:0.85em; color:var(--text-muted); margin:4px 0 0; min-height:1.2em;';
+
+        // Plan dropdown (async-loaded)
+        new Setting(containerEl)
+            .setName('Plan')
+            .setDesc('Choose the Planner plan to import tasks from.')
+            .addDropdown((dd) => {
+                dd.addOption('', 'Loading plans…');
+                dd.setDisabled(true);
+
+                if (!this.plannerSyncManager) {
+                    dd.selectEl.empty();
+                    dd.addOption('', '— Planner not initialised —');
+                    return;
+                }
+
+                const client = this.plannerSyncManager.getApiClient();
+                client
+                    .getMyPlans()
+                    .then((plans: PlannerPlan[]) => {
+                        dd.selectEl.empty();
+                        dd.addOption('', '— Select a plan —');
+                        for (const p of plans) {
+                            dd.addOption(p.id, p.title);
+                        }
+                        dd.setDisabled(false);
+                        dd.onChange(async (planId) => {
+                            importPlanId = planId;
+                            importBucketId = '';
+                            importBuckets = [];
+                            bucketContainer.empty();
+                            if (!planId) return;
+                            try {
+                                importBuckets = await client.getPlanBuckets(planId);
+                                renderBucketDropdown();
+                            } catch {
+                                importStatusEl.textContent = 'Failed to load buckets.';
+                            }
+                        });
+                    })
+                    .catch(() => {
+                        dd.selectEl.empty();
+                        dd.addOption('', '— Failed to load plans —');
+                    });
+            });
+
+        // Bucket container — inserted right after Plan in the DOM so it appears below it
+        const bucketContainer = containerEl.createDiv();
+
+        const renderBucketDropdown = (): void => {
+            bucketContainer.empty();
+            if (!importPlanId || importBuckets.length === 0) return;
+
+            new Setting(bucketContainer)
+                .setName('Bucket (optional)')
+                .setDesc('Limit import to this bucket. Leave at "All buckets" to import everything.')
+                .addDropdown((dd) => {
+                    dd.addOption('', 'All buckets');
+                    for (const b of importBuckets) {
+                        dd.addOption(b.id, b.name);
+                    }
+                    dd.setValue(importBucketId);
+                    dd.onChange((v) => {
+                        importBucketId = v;
+                    });
+                });
+        };
+
+        // Target file path input
+        new Setting(containerEl)
+            .setName('Target file')
+            .setDesc('Vault-relative path of the file to append imported tasks to (created if absent).')
+            .addText((text) => {
+                text.setPlaceholder('Planner Tasks.md')
+                    .setValue(importTargetPath)
+                    .onChange((v) => {
+                        importTargetPath = v.trim() || 'Planner Tasks.md';
+                    });
+            })
+            .addButton((btn) => {
+                btn.setButtonText('Import').onClick(async () => {
+                    if (!importPlanId) {
+                        importStatusEl.textContent = 'Please select a plan first.';
+                        return;
+                    }
+                    if (!this.plannerSyncManager) {
+                        importStatusEl.textContent = 'Planner sync manager not available.';
+                        return;
+                    }
+                    btn.setDisabled(true);
+                    btn.setButtonText('Importing…');
+                    importStatusEl.textContent = 'Importing…';
+                    try {
+                        const count = await this.plannerSyncManager.importFromPlanner(
+                            importPlanId,
+                            importBucketId || undefined,
+                            importTargetPath,
+                        );
+                        importStatusEl.textContent =
+                            count === 0
+                                ? 'No new tasks to import (all already linked or plan is empty).'
+                                : `Imported ${count} task${count === 1 ? '' : 's'} → ${importTargetPath}`;
+                    } catch (err) {
+                        importStatusEl.textContent = `Import failed: ${err instanceof Error ? err.message : String(err)}`;
+                    } finally {
+                        btn.setDisabled(false);
+                        btn.setButtonText('Import');
+                    }
+                });
+            });
+    }
+
+    // -----------------------------------------------------------------------
+    // Planner settings helpers
+    // -----------------------------------------------------------------------
+
+    private async startPlannerAuth(statusEl: HTMLElement, onDone: () => void): Promise<void> {
+        const ps = getSettings().plannerSettings;
+        if (!ps.tenantId || !ps.clientId) {
+            new Notice('Please enter Tenant ID and Client ID before authenticating.');
+            onDone();
+            return;
+        }
+
+        this.authAbortController = new AbortController();
+
+        try {
+            const dc = await PlannerAuth.startDeviceCodeFlow(ps.tenantId, ps.clientId);
+            statusEl.innerHTML =
+                `<strong>Step 1:</strong> Open ` +
+                `<a href="${dc.verification_uri}" target="_blank">${dc.verification_uri}</a> ` +
+                `in your browser and enter code: <strong>${dc.user_code}</strong><br>` +
+                `<em>Waiting for authorisation…</em>`;
+
+            const tokens = await PlannerAuth.pollForToken(
+                ps.tenantId,
+                ps.clientId,
+                dc.device_code,
+                dc.interval,
+                this.authAbortController.signal,
+            );
+
+            // Save tokens
+            updateSettings({
+                plannerSettings: {
+                    ...getSettings().plannerSettings,
+                    accessToken: tokens.access_token,
+                    accessTokenExpiresAt: Date.now() + tokens.expires_in * 1000,
+                    refreshToken: tokens.refresh_token ?? '',
+                },
+            });
+            await this.plugin.saveSettings();
+
+            // Fetch and save user info
+            const client = this.plannerSyncManager?.getApiClient();
+            if (client) {
+                try {
+                    const me = await client.getMe();
+                    updateSettings({
+                        plannerSettings: {
+                            ...getSettings().plannerSettings,
+                            userId: me.id,
+                            userDisplayName: me.displayName,
+                        },
+                    });
+                    await this.plugin.saveSettings();
+                } catch {
+                    // Non-fatal — user info can be fetched later
+                }
+            }
+
+            this.authAbortController = null;
+            onDone();
+            new Notice('Planner: authentication successful!');
+            this.display(); // full re-render only after completion
+        } catch (err: unknown) {
+            this.authAbortController = null;
+            const raw = err instanceof Error ? err.message : String(err);
+            const message = raw.includes('client_assertion or client_secret')
+                ? 'App is not configured as a public client. ' +
+                  'In Azure Portal → App registrations → your app → Authentication → ' +
+                  'Advanced settings: set "Allow public client flows" to Yes, then save.'
+                : raw;
+            statusEl.textContent = `Authentication failed: ${message}`;
+            onDone();
+        }
+    }
+
+    private renderPlanDropdown(
+        containerEl: HTMLElement,
+        label: string,
+        currentPlanId: string,
+        onChange: (plan: PlannerPlan) => Promise<void>,
+    ): void {
+        if (!this.plannerSyncManager) return;
+        const client = this.plannerSyncManager.getApiClient();
+
+        const setting = new Setting(containerEl).setName(label).setDesc('Loading plans…');
+
+        client
+            .getMyPlans()
+            .then((plans) => {
+                setting.setDesc('');
+                setting.addDropdown((dd) => {
+                    dd.addOption('', '— select plan —');
+                    for (const plan of plans) dd.addOption(plan.id, plan.title);
+                    dd.setValue(currentPlanId);
+                    dd.onChange(async (id) => {
+                        const plan = plans.find((p) => p.id === id);
+                        if (plan) await onChange(plan);
+                    });
+                });
+            })
+            .catch(() => setting.setDesc('Failed to load plans. Check your credentials.'));
+    }
+
+    private renderWatchedBucketsSection(containerEl: HTMLElement, planId: string): void {
+        if (!this.plannerSyncManager) return;
+        const client = this.plannerSyncManager.getApiClient();
+
+        // Create a scoped wrapper div synchronously so it occupies the correct
+        // position in the DOM before the async bucket fetch completes.
+        const wrapper = containerEl.createDiv();
+
+        const heading = new Setting(wrapper)
+            .setName('Additional watched buckets')
+            .setDesc('Loading buckets…');
+
+        client
+            .getPlanBuckets(planId)
+            .then((buckets) => {
+                heading.setDesc(
+                    'Buckets included in pull-sync and import alongside the default bucket. ' +
+                        'The default bucket is always watched.',
+                );
+
+                const ps = getSettings().plannerSettings;
+
+                // Render one toggle per bucket (excluding the default bucket)
+                for (const bucket of buckets) {
+                    if (bucket.id === ps.defaultBucketId) continue; // always watched, no toggle needed
+
+                    const isWatched = ps.watchedBucketIds.includes(bucket.id);
+
+                    new Setting(wrapper)
+                        .setName(bucket.name)
+                        .setClass('planner-watched-bucket-row')
+                        .addToggle((toggle) => {
+                            toggle.setValue(isWatched).onChange(async (enabled) => {
+                                const current = getSettings().plannerSettings;
+                                const updated = enabled
+                                    ? [...current.watchedBucketIds, bucket.id]
+                                    : current.watchedBucketIds.filter((id) => id !== bucket.id);
+                                updateSettings({
+                                    plannerSettings: { ...current, watchedBucketIds: updated },
+                                });
+                                await this.plugin.saveSettings();
+                            });
+                        });
+                }
+
+                if (buckets.filter((b) => b.id !== ps.defaultBucketId).length === 0) {
+                    heading.setDesc('No other buckets found in this plan.');
+                }
+            })
+            .catch(() => heading.setDesc('Failed to load buckets.'));
+    }
+
+    private renderBucketDropdown(
+        containerEl: HTMLElement,
+        label: string,
+        planId: string,
+        currentBucketId: string,
+        onChange: (bucket: PlannerBucket) => Promise<void>,
+    ): void {
+        if (!this.plannerSyncManager) return;
+        const client = this.plannerSyncManager.getApiClient();
+
+        const setting = new Setting(containerEl).setName(label).setDesc('Loading buckets…');
+
+        client
+            .getPlanBuckets(planId)
+            .then((buckets) => {
+                setting.setDesc('');
+                setting.addDropdown((dd) => {
+                    dd.addOption('', '— select bucket —');
+                    for (const b of buckets) dd.addOption(b.id, b.name);
+                    dd.setValue(currentBucketId);
+                    dd.onChange(async (id) => {
+                        const bucket = buckets.find((b) => b.id === id);
+                        if (bucket) await onChange(bucket);
+                    });
+                });
+            })
+            .catch(() => setting.setDesc('Failed to load buckets.'));
+    }
+
+    private renderTagMappingRows(
+        containerEl: HTMLElement,
+        mappings: TagBucketMapping[],
+        defaultPlanId: string,
+        defaultPlanTitle: string,
+    ): void {
+        if (mappings.length === 0) return;
+
+        // Column header row
+        const header = containerEl.createDiv({
+            attr: {
+                style: 'display:grid; grid-template-columns:1fr 1fr auto; gap:8px; ' +
+                       'padding:4px 16px; font-size:0.8em; color:var(--text-muted);',
+            },
+        });
+        header.createSpan({ text: '#tag' });
+        header.createSpan({ text: '→ bucket' });
+        header.createSpan();
+
+        mappings.forEach((mapping, index) => {
+            const planId = mapping.planId || defaultPlanId;
+
+            const row = new Setting(containerEl)
+                .addText((text) => {
+                    text.setPlaceholder('#tag')
+                        .setValue(mapping.tag)
+                        .onChange(
+                            debounce(async (value) => {
+                                const current = getSettings().plannerSettings;
+                                const updated = [...current.tagMappings];
+                                updated[index] = {
+                                    ...updated[index],
+                                    tag: value.trim(),
+                                    // Ensure plan is always filled from the default
+                                    planId: updated[index].planId || defaultPlanId,
+                                    planTitle: updated[index].planTitle || defaultPlanTitle,
+                                };
+                                updateSettings({ plannerSettings: { ...current, tagMappings: updated } });
+                                await this.plugin.saveSettings();
+                            }, 500, true),
+                        );
+                    text.inputEl.style.width = '130px';
+                })
+                .addDropdown((dd) => {
+                    dd.addOption('', mapping.bucketTitle || '— bucket —');
+                    if (planId) {
+                        this.plannerSyncManager
+                            ?.getApiClient()
+                            .getPlanBuckets(planId)
+                            .then((buckets) => {
+                                dd.selectEl.empty();
+                                dd.addOption('', '— select bucket —');
+                                for (const b of buckets) dd.addOption(b.id, b.name);
+                                dd.setValue(mapping.bucketId);
+                                dd.onChange(async (id) => {
+                                    const bucket = buckets.find((b) => b.id === id);
+                                    if (!bucket) return;
+                                    const current = getSettings().plannerSettings;
+                                    const updated = [...current.tagMappings];
+                                    updated[index] = {
+                                        ...updated[index],
+                                        planId: planId,
+                                        planTitle: defaultPlanTitle,
+                                        bucketId: bucket.id,
+                                        bucketTitle: bucket.name,
+                                    };
+                                    updateSettings({ plannerSettings: { ...current, tagMappings: updated } });
+                                    await this.plugin.saveSettings();
+                                });
+                            })
+                            .catch(() => {/* silent */});
+                    }
+                })
+                .addExtraButton((btn) => {
+                    btn.setIcon('trash').setTooltip('Remove').onClick(async () => {
+                        const current = getSettings().plannerSettings;
+                        const updated = current.tagMappings.filter((_, i) => i !== index);
+                        updateSettings({ plannerSettings: { ...current, tagMappings: updated } });
+                        await this.plugin.saveSettings();
+                        this.display();
+                    });
+                });
+            row.nameEl.remove();
+        });
     }
 
     private seeTheDocumentation(url: string) {

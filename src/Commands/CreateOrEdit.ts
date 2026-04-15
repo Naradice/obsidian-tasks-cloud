@@ -3,8 +3,19 @@ import { TaskModal } from '../Obsidian/TaskModal';
 import type { Task } from '../Task/Task';
 import { DateFallback } from '../DateTime/DateFallback';
 import { taskFromLine } from './CreateOrEditTaskParser';
+import { getSettings } from '../Config/Settings';
+import { PlannerAuth } from '../Planner/PlannerAuth';
+import { PlannerTaskModal } from '../Planner/PlannerTaskModal';
+import type { PlannerSyncManager } from '../Planner/PlannerSyncManager';
 
-export const createOrEdit = (checking: boolean, editor: Editor, view: View, app: App, allTasks: Task[]) => {
+export const createOrEdit = (
+    checking: boolean,
+    editor: Editor,
+    view: View,
+    app: App,
+    allTasks: Task[],
+    plannerSyncManager?: PlannerSyncManager,
+) => {
     if (checking) {
         return view instanceof MarkdownView;
     }
@@ -31,12 +42,13 @@ export const createOrEdit = (checking: boolean, editor: Editor, view: View, app:
         editor.setLine(lineNumber, serialized);
     };
 
-    // Need to create a new instance every time, as cursor/task can change.
-    const taskModal = new TaskModal({
-        app,
-        task,
-        onSubmit,
-        allTasks,
-    });
+    // Use PlannerTaskModal when the Planner integration is active.
+    const ps = getSettings().plannerSettings;
+    const usePlanner = plannerSyncManager && ps.enabled && PlannerAuth.isAuthenticated(ps) && ps.defaultPlanId !== '';
+
+    const taskModal = usePlanner
+        ? new PlannerTaskModal({ app, task, onSubmit, allTasks, syncManager: plannerSyncManager! })
+        : new TaskModal({ app, task, onSubmit, allTasks });
+
     taskModal.open();
 };

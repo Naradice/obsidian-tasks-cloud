@@ -20,11 +20,14 @@ import { tasksApiV1 } from './Api';
 import { GlobalFilter } from './Config/GlobalFilter';
 import { QueryFileDefaults } from './Query/QueryFileDefaults';
 import { LinkResolver } from './Task/LinkResolver';
+import { PlannerSyncManager } from './Planner/PlannerSyncManager';
 
 export default class TasksPlugin extends Plugin {
     private cache: Cache | undefined;
     public inlineRenderer: InlineRenderer | undefined;
     public queryRenderer: QueryRenderer | undefined;
+    public plannerSyncManager: PlannerSyncManager | undefined;
+    private settingsTab: SettingsTab | undefined;
 
     get apiV1() {
         return tasksApiV1(this);
@@ -51,7 +54,8 @@ export default class TasksPlugin extends Plugin {
 
         const events = new TasksEvents({ obsidianEvents: this.app.workspace });
 
-        this.addSettingTab(new SettingsTab({ plugin: this, events }));
+        this.settingsTab = new SettingsTab({ plugin: this, events });
+        this.addSettingTab(this.settingsTab);
 
         initializeFile({
             metadataCache: this.app.metadataCache,
@@ -72,6 +76,22 @@ export default class TasksPlugin extends Plugin {
         this.inlineRenderer = new InlineRenderer({ plugin: this, app: this.app });
         this.queryRenderer = new QueryRenderer({ plugin: this, events });
 
+        // Planner integration
+        this.plannerSyncManager = new PlannerSyncManager(this, events);
+        this.settingsTab?.setPlannerSyncManager(this.plannerSyncManager);
+        this.app.workspace.onLayoutReady(async () => {
+            await this.plannerSyncManager!.initialize();
+        });
+
+        // Push task changes to Planner on every cache update
+        this.registerEvent(
+            events.onCacheUpdate(({ tasks }) => {
+                this.plannerSyncManager
+                    ?.onTasksChanged(tasks)
+                    .catch((err) => console.error('Planner onTasksChanged error:', err));
+            }),
+        );
+
         // Update types.json.
         this.setObsidianPropertiesTypes();
 
@@ -88,6 +108,7 @@ export default class TasksPlugin extends Plugin {
     onunload() {
         log('info', i18n.t('main.unloadingPlugin', { name: this.manifest.name, version: this.manifest.version }));
         this.cache?.unload();
+        this.plannerSyncManager?.unload();
     }
 
     async loadSettings() {

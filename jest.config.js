@@ -9,7 +9,7 @@ module.exports = {
                 preprocess: true,
             },
         ],
-        '^.+\\.ts$': 'ts-jest',
+        '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.test.json', diagnostics: false }],
     },
     moduleFileExtensions: ['js', 'ts', 'svelte'],
     testEnvironment: 'jsdom',

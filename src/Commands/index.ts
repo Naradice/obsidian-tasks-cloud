@@ -3,6 +3,7 @@ import type TasksPlugin from '../main';
 import { createOrEdit } from './CreateOrEdit';
 
 import { toggleDone } from './ToggleDone';
+import { cancelTask } from './CancelTask';
 import { ensureQueryFileDefaultsInFrontmatter } from './AddQueryFileDefaultsProperties';
 
 export class Commands {
@@ -21,7 +22,14 @@ export class Commands {
             icon: 'pencil',
             editorCheckCallback: (checking: boolean, editor: Editor, view: MarkdownView | MarkdownFileInfo) => {
                 // TODO Need to explore what happens if a tasks code block is rendered before the Cache has been created.
-                return createOrEdit(checking, editor, view as View, this.app, this.plugin.getTasks());
+                return createOrEdit(
+                    checking,
+                    editor,
+                    view as View,
+                    this.app,
+                    this.plugin.getTasks(),
+                    this.plugin.plannerSyncManager,
+                );
             },
         });
 
@@ -30,6 +38,13 @@ export class Commands {
             name: 'Toggle task done',
             icon: 'check-in-circle',
             editorCheckCallback: toggleDone,
+        });
+
+        plugin.addCommand({
+            id: 'cancel-task',
+            name: 'Cancel task',
+            icon: 'x-circle',
+            editorCheckCallback: cancelTask,
         });
 
         plugin.addCommand({

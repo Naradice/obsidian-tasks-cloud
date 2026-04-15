@@ -1,6 +1,6 @@
-@import 'flatpickr/dist/flatpickr.css';
-@import './Renderer/Renderer';
-@import './ui/EditTask';
-@import './ui/Dependency';
-@import './Config/SettingsTab';
-@import './Config/PresetsSettingsUI';
+@use 'flatpickr/dist/flatpickr.css';
+@use './Renderer/Renderer';
+@use './ui/EditTask';
+@use './ui/Dependency';
+@use './Config/SettingsTab';
+@use './Config/PresetsSettingsUI';
