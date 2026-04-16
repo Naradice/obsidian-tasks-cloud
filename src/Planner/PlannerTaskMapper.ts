@@ -42,7 +42,7 @@ export class PlannerTaskMapper {
         return {
             planId,
             bucketId,
-            title: task.descriptionWithoutTags.trim(),
+            title: task.descriptionWithoutTags.trim().slice(0, 255),
             dueDateTime: task.dueDate?.isValid() ? task.dueDate.utc().startOf('day').toISOString() : null,
             priority: PlannerTaskMapper.mapPriority(task.priority, settings),
             percentComplete: PlannerTaskMapper.statusToPercent(task),
@@ -53,7 +53,7 @@ export class PlannerTaskMapper {
     static toSnapshot(task: Task, settings: PlannerSettings): SyncSnapshot {
         const { bucketId } = PlannerTaskMapper.resolvePlanBucket(task, settings);
         return {
-            title: task.descriptionWithoutTags.trim(),
+            title: task.descriptionWithoutTags.trim().slice(0, 255),
             dueDate: task.dueDate?.isValid() ? task.dueDate.format('YYYY-MM-DD') : null,
             priority: task.priority,
             statusSymbol: task.status.symbol,

@@ -64,14 +64,31 @@ export interface PlannerSettings {
 }
 
 /**
- * Returns all bucket IDs to watch: the default bucket plus any extras.
- * Deduplicates in case the default is also listed in watchedBucketIds.
+ * Returns all plan IDs that should be watched: the default plan plus any
+ * plans referenced in tag mappings.
+ */
+export function allWatchedPlanIds(ps: PlannerSettings): string[] {
+    const ids = new Set<string>();
+    if (ps.defaultPlanId) ids.add(ps.defaultPlanId);
+    for (const m of ps.tagMappings) {
+        if (m.planId) ids.add(m.planId);
+    }
+    return Array.from(ids);
+}
+
+/**
+ * Returns all bucket IDs to watch: the default bucket, any extras, plus
+ * buckets from tag mappings (which may span multiple plans).
+ * Deduplicates automatically.
  */
 export function allWatchedBucketIds(ps: PlannerSettings): string[] {
     const ids = new Set<string>();
     if (ps.defaultBucketId) ids.add(ps.defaultBucketId);
     for (const id of ps.watchedBucketIds) {
         if (id) ids.add(id);
+    }
+    for (const m of ps.tagMappings) {
+        if (m.bucketId) ids.add(m.bucketId);
     }
     return Array.from(ids);
 }

@@ -4,7 +4,7 @@ import type { Task } from '../Task/Task';
 import type { PlannerSyncManager } from './PlannerSyncManager';
 import type { PlannerTask } from './PlannerApiClient';
 import { getSettings } from '../Config/Settings';
-import { allWatchedBucketIds } from './PlannerSettings';
+import { allWatchedBucketIds, allWatchedPlanIds } from './PlannerSettings';
 
 // ---------------------------------------------------------------------------
 // PlannerTaskModal
@@ -216,14 +216,9 @@ export class PlannerTaskModal extends TaskModal {
         const client = this.syncManager.getApiClient();
         const ps = getSettings().plannerSettings;
 
-        const planIds = new Set<string>([ps.defaultPlanId]);
-        for (const m of ps.tagMappings) {
-            if (m.planId) planIds.add(m.planId);
-        }
-
         const watchedIds = new Set(allWatchedBucketIds(ps));
 
-        const fetches = Array.from(planIds).map((id) =>
+        const fetches = allWatchedPlanIds(ps).map((id) =>
             client.getPlanTasks(id).catch(() => [] as PlannerTask[]),
         );
 

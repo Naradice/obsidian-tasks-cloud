@@ -63,6 +63,25 @@ export class PlannerSyncManager {
      */
     private readonly pendingLinks = new Map<string, string>();
 
+    /**
+     * Set on the very first onTasksChanged call so we can distinguish
+     * pre-existing vault tasks from tasks genuinely created after the plugin
+     * was enabled.  Keyed by compositeKey (path:line).
+     */
+    private readonly preExistingTaskKeys = new Set<string>();
+
+    /** False until the first onTasksChanged snapshot has been taken. */
+    private initialSnapshotBuilt = false;
+
+    /** True while processTasksChanged is running, to prevent concurrent execution. */
+    private isProcessingTasksChanged = false;
+
+    /**
+     * If onTasksChanged is called while already processing, the latest snapshot
+     * is stored here and processed once the current run finishes.
+     */
+    private pendingTasksSnapshot: Task[] | null = null;
+
     private syncIntervalId: number | null = null;
 
     constructor(plugin: TasksPlugin, events: TasksEvents) {
@@ -158,17 +177,56 @@ export class PlannerSyncManager {
 
     /**
      * Called by main.ts whenever the task cache emits an update.
-     * Diffs the new list against the previous snapshot to detect creates,
-     * updates, and deletes, then pushes changes to Planner.
+     * Serialises execution: if a previous call is still in-flight the incoming
+     * snapshot is buffered and processed once the current run finishes.
      */
     async onTasksChanged(allTasks: Task[]): Promise<void> {
-        // Always update snapshot, even when not ready, so we don't accumulate
-        // a backlog of "new" tasks the first time the integration is enabled.
+        // Always update snapshot when not ready, so we never accumulate a
+        // backlog of "new" tasks the first time the integration is enabled.
         if (!this.isReady()) {
             this.rebuildSnapshot(allTasks);
             return;
         }
 
+        // ── First call: record every existing task location so we can
+        //   distinguish pre-existing tasks from genuinely new ones.
+        //   Do NOT auto-assign IDs or push anything here.
+        if (!this.initialSnapshotBuilt) {
+            this.initialSnapshotBuilt = true;
+            for (const task of allTasks) {
+                this.preExistingTaskKeys.add(this.compositeKey(task));
+            }
+            this.rebuildSnapshot(allTasks);
+            return;
+        }
+
+        // If already processing, buffer the latest snapshot and return.
+        // The running call will drain the buffer when it finishes.
+        if (this.isProcessingTasksChanged) {
+            this.pendingTasksSnapshot = allTasks;
+            return;
+        }
+
+        this.isProcessingTasksChanged = true;
+        try {
+            await this.processTasksChanged(allTasks);
+
+            // Process the latest buffered snapshot if one arrived during our run.
+            while (this.pendingTasksSnapshot !== null) {
+                const pending = this.pendingTasksSnapshot;
+                this.pendingTasksSnapshot = null;
+                await this.processTasksChanged(pending);
+            }
+        } finally {
+            this.isProcessingTasksChanged = false;
+        }
+    }
+
+    /**
+     * Core diff-and-push logic. Only ever called from onTasksChanged, which
+     * ensures this never runs concurrently with itself.
+     */
+    private async processTasksChanged(allTasks: Task[]): Promise<void> {
         const settings = this.getSettings();
         const newMap = new Map<string, Task>();
 
@@ -189,24 +247,27 @@ export class PlannerSyncManager {
 
         // Created or updated tasks
         for (const [id, newTask] of newMap) {
-            // If the ID was just auto-assigned in a previous cycle, clear the
-            // marker but do NOT skip — this is the cycle where we should create
-            // the task in Planner (the task is new: not in previousTasks, not in index).
             const compositeKey = this.compositeKey(newTask);
             this.pendingIdAssignments.delete(compositeKey);
 
             const oldTask = this.previousTasks.get(id);
 
             if (!oldTask) {
-                // Genuinely new task (or newly ID'd task on second cache fire)
                 if (!this.index.isLinked(id)) {
-                    // UC2: check if the modal pre-selected a Planner task to link
-                    const pendingPlannerId = this.pendingLinks.get(newTask.descriptionWithoutTags.trim());
-                    if (pendingPlannerId) {
-                        this.pendingLinks.delete(newTask.descriptionWithoutTags.trim());
-                        await this.linkExistingPlannerTask(id, pendingPlannerId);
+                    // Pre-existing vault task that just received its auto-assigned ID —
+                    // do not push to Planner; let the user import explicitly if needed.
+                    if (this.preExistingTaskKeys.has(compositeKey)) {
+                        this.preExistingTaskKeys.delete(compositeKey);
+                        // fall through to rebuildSnapshot so future edits are tracked
                     } else {
-                        await this.pushCreate(id, newTask);
+                        // Genuinely new task
+                        const pendingPlannerId = this.pendingLinks.get(newTask.descriptionWithoutTags.trim());
+                        if (pendingPlannerId) {
+                            this.pendingLinks.delete(newTask.descriptionWithoutTags.trim());
+                            await this.linkExistingPlannerTask(id, pendingPlannerId);
+                        } else {
+                            await this.pushCreate(id, newTask);
+                        }
                     }
                 }
             } else if (!oldTask.identicalTo(newTask)) {

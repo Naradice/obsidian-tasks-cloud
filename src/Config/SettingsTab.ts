@@ -721,8 +721,8 @@ export class SettingsTab extends PluginSettingTab {
         new Setting(containerEl)
             .setName('')
             .setDesc(
-                'By default every task goes to the default bucket. ' +
-                    'Add a #tag to a task to send it to a different bucket instead. ' +
+                'By default every task goes to the default plan/bucket. ' +
+                    'Add a #tag to route it to a different plan or bucket instead. ' +
                     'The first matching tag wins.',
             );
 
@@ -1166,16 +1166,20 @@ export class SettingsTab extends PluginSettingTab {
         // Column header row
         const header = containerEl.createDiv({
             attr: {
-                style: 'display:grid; grid-template-columns:1fr 1fr auto; gap:8px; ' +
+                style: 'display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:8px; ' +
                        'padding:4px 16px; font-size:0.8em; color:var(--text-muted);',
             },
         });
         header.createSpan({ text: '#tag' });
+        header.createSpan({ text: '→ plan' });
         header.createSpan({ text: '→ bucket' });
         header.createSpan();
 
         mappings.forEach((mapping, index) => {
-            const planId = mapping.planId || defaultPlanId;
+            const resolvedPlanId = mapping.planId || defaultPlanId;
+
+            // Bucket dropdown — built once, reloaded when plan changes
+            let bucketSelectEl: HTMLSelectElement | null = null;
 
             const row = new Setting(containerEl)
                 .addText((text) => {
@@ -1188,7 +1192,6 @@ export class SettingsTab extends PluginSettingTab {
                                 updated[index] = {
                                     ...updated[index],
                                     tag: value.trim(),
-                                    // Ensure plan is always filled from the default
                                     planId: updated[index].planId || defaultPlanId,
                                     planTitle: updated[index].planTitle || defaultPlanTitle,
                                 };
@@ -1196,14 +1199,73 @@ export class SettingsTab extends PluginSettingTab {
                                 await this.plugin.saveSettings();
                             }, 500, true),
                         );
-                    text.inputEl.style.width = '130px';
+                    text.inputEl.style.width = '110px';
+                })
+                .addDropdown((planDd) => {
+                    // Show current plan immediately, then load full list async
+                    planDd.addOption(resolvedPlanId, mapping.planTitle || defaultPlanTitle || resolvedPlanId);
+                    planDd.setValue(resolvedPlanId);
+
+                    if (!this.plannerSyncManager) return;
+                    const client = this.plannerSyncManager.getApiClient();
+
+                    client.getMyPlans().then((plans) => {
+                        planDd.selectEl.empty();
+                        for (const p of plans) planDd.addOption(p.id, p.title);
+                        planDd.setValue(resolvedPlanId);
+
+                        planDd.onChange(async (newPlanId) => {
+                            const selectedPlan = plans.find((p) => p.id === newPlanId);
+                            if (!selectedPlan) return;
+
+                            // Persist plan change, clear bucket
+                            const current = getSettings().plannerSettings;
+                            const updated = [...current.tagMappings];
+                            updated[index] = {
+                                ...updated[index],
+                                planId: selectedPlan.id,
+                                planTitle: selectedPlan.title,
+                                bucketId: '',
+                                bucketTitle: '',
+                            };
+                            updateSettings({ plannerSettings: { ...current, tagMappings: updated } });
+                            await this.plugin.saveSettings();
+
+                            // Reload bucket dropdown for the new plan
+                            if (bucketSelectEl) {
+                                const bdEl = bucketSelectEl;
+                                bdEl.empty();
+                                const loadingOpt = document.createElement('option');
+                                loadingOpt.value = '';
+                                loadingOpt.textContent = 'Loading…';
+                                bdEl.appendChild(loadingOpt);
+
+                                client.getPlanBuckets(selectedPlan.id).then((buckets) => {
+                                    bdEl.empty();
+                                    const placeholder = document.createElement('option');
+                                    placeholder.value = '';
+                                    placeholder.textContent = '— select bucket —';
+                                    bdEl.appendChild(placeholder);
+                                    for (const b of buckets) {
+                                        const o = document.createElement('option');
+                                        o.value = b.id;
+                                        o.textContent = b.name;
+                                        bdEl.appendChild(o);
+                                    }
+                                    bdEl.value = '';
+                                }).catch(() => {/* silent */});
+                            }
+                        });
+                    }).catch(() => {/* silent */});
                 })
                 .addDropdown((dd) => {
+                    bucketSelectEl = dd.selectEl;
                     dd.addOption('', mapping.bucketTitle || '— bucket —');
-                    if (planId) {
+
+                    if (resolvedPlanId) {
                         this.plannerSyncManager
                             ?.getApiClient()
-                            .getPlanBuckets(planId)
+                            .getPlanBuckets(resolvedPlanId)
                             .then((buckets) => {
                                 dd.selectEl.empty();
                                 dd.addOption('', '— select bucket —');
@@ -1216,8 +1278,6 @@ export class SettingsTab extends PluginSettingTab {
                                     const updated = [...current.tagMappings];
                                     updated[index] = {
                                         ...updated[index],
-                                        planId: planId,
-                                        planTitle: defaultPlanTitle,
                                         bucketId: bucket.id,
                                         bucketTitle: bucket.name,
                                     };
