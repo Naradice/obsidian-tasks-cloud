@@ -205,12 +205,15 @@ async function getTaskAndFileLines(task: ListItem, vault: Vault): Promise<[numbe
 
     const fileCache = metadataCache.getFileCache(file);
     if (fileCache == undefined || fileCache === null) {
-        throw new WarningWorthRetrying(`Tasks: No file cache found for file ${file.path}. Retrying ...`);
+        // File cache is transiently unavailable (common during vault startup).
+        // Retry silently — no need to surface this to the user every attempt.
+        throw new RetryWithoutWarning();
     }
 
     const listItemsCache = fileCache.listItems;
     if (listItemsCache === undefined || listItemsCache.length === 0) {
-        throw new WarningWorthRetrying(`Tasks: No list items found in file cache of ${file.path}. Retrying ...`);
+        // Same: list items not yet populated, retry quietly.
+        throw new RetryWithoutWarning();
     }
 
     // We can now try and find which line in the file currently contains originalTask,

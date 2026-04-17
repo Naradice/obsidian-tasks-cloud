@@ -56,6 +56,16 @@ export class PlannerSyncManager {
     private readonly pendingIdAssignments = new Set<string>();
 
     /**
+     * Maps compositeKey (path:line) → assigned task ID.
+     * Set the moment autoAssignId picks an ID (before the async file write).
+     * Lets processTasksChanged restore the same ID if the line is subsequently
+     * overwritten without the ID (e.g. by the edit modal reading a stale editor
+     * buffer before autoAssignId's vault write was reflected).
+     * Cleared when the task with the confirmed ID is processed in newMap.
+     */
+    private readonly assignedIdAtKey = new Map<string, string>();
+
+    /**
      * Pending links from UC2: when the user picks an existing Planner task in the
      * modal but the Obsidian task has no 🆔 ID yet, we store the intent here.
      * Key = trimmed task description; value = Planner task ID to link.
@@ -234,7 +244,24 @@ export class PlannerSyncManager {
             if (task.id) {
                 newMap.set(task.id, task);
             } else if (settings.autoAssignTaskIds) {
-                await this.autoAssignId(task);
+                const key = this.compositeKey(task);
+                const restoredId = this.assignedIdAtKey.get(key);
+                if (restoredId && !this.pendingIdAssignments.has(key)) {
+                    // A previous autoAssignId wrote this ID but the line was
+                    // subsequently overwritten without it (e.g. by the edit modal
+                    // reading a stale editor buffer).  Re-write with the same ID
+                    // so the Planner index mapping stays valid.
+                    this.pendingIdAssignments.add(key);
+                    const restoredTask = new TaskClass({ ...task, id: restoredId });
+                    try {
+                        await replaceTaskWithTasks({ originalTask: task, newTasks: restoredTask });
+                    } catch (err) {
+                        console.error('Planner: restoreId failed', err);
+                        this.pendingIdAssignments.delete(key);
+                    }
+                } else {
+                    await this.autoAssignId(task);
+                }
             }
         }
 
@@ -249,6 +276,7 @@ export class PlannerSyncManager {
         for (const [id, newTask] of newMap) {
             const compositeKey = this.compositeKey(newTask);
             this.pendingIdAssignments.delete(compositeKey);
+            this.assignedIdAtKey.delete(compositeKey); // ID confirmed in cache — no longer need recovery mapping
 
             const oldTask = this.previousTasks.get(id);
 
@@ -535,6 +563,13 @@ export class PlannerSyncManager {
 
         const existingIds = Array.from(this.previousTasks.keys());
         const newId = generateUniqueId(existingIds);
+
+        // Record the chosen ID BEFORE the async write.  If the edit modal
+        // subsequently overwrites the line without the ID (because it read a stale
+        // editor buffer), processTasksChanged will restore this ID instead of
+        // generating a second one.
+        this.assignedIdAtKey.set(key, newId);
+
         const updatedTask = new TaskClass({ ...task, id: newId });
 
         try {
@@ -542,9 +577,10 @@ export class PlannerSyncManager {
         } catch (err) {
             console.error('Planner: autoAssignId failed', err);
             this.pendingIdAssignments.delete(key);
+            this.assignedIdAtKey.delete(key);
         }
-        // pendingIdAssignments entry is removed in onTasksChanged when the
-        // newly-ID'd task arrives in the next cache update.
+        // pendingIdAssignments / assignedIdAtKey entries are removed in
+        // processTasksChanged when the confirmed-ID task appears in newMap.
     }
 
     // -----------------------------------------------------------------------

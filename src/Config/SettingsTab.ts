@@ -72,6 +72,11 @@ export class SettingsTab extends PluginSettingTab {
     public display(): void {
         const { containerEl } = this;
 
+        // Preserve scroll position across re-renders so clicking buttons doesn't
+        // jump the panel back to the top.
+        const scrollEl = containerEl.closest('.vertical-tab-content-container') as HTMLElement | null;
+        const savedScroll = scrollEl?.scrollTop ?? 0;
+
         containerEl.empty();
         this.containerEl.addClass('tasks-settings');
 
@@ -560,6 +565,14 @@ export class SettingsTab extends PluginSettingTab {
         // ---------------------------------------------------------------------------
 
         this.renderPlannerSettings(containerEl);
+
+        // Restore scroll position after DOM rebuild (use requestAnimationFrame so
+        // the browser has painted the new layout before we set scrollTop).
+        if (scrollEl && savedScroll > 0) {
+            requestAnimationFrame(() => {
+                scrollEl.scrollTop = savedScroll;
+            });
+        }
     }
 
     // ---------------------------------------------------------------------------
