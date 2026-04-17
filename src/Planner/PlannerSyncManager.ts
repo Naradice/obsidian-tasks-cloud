@@ -288,13 +288,20 @@ export class PlannerSyncManager {
                         this.preExistingTaskKeys.delete(compositeKey);
                         // fall through to rebuildSnapshot so future edits are tracked
                     } else {
-                        // Genuinely new task
-                        const pendingPlannerId = this.pendingLinks.get(newTask.descriptionWithoutTags.trim());
-                        if (pendingPlannerId) {
-                            this.pendingLinks.delete(newTask.descriptionWithoutTags.trim());
-                            await this.linkExistingPlannerTask(id, pendingPlannerId);
-                        } else {
-                            await this.pushCreate(id, newTask);
+                        // Genuinely new task — skip if already closed (done / cancelled)
+                        // so that old completed tasks in the vault are never pushed to Planner.
+                        const isClosed =
+                            newTask.status.type === StatusType.DONE ||
+                            newTask.status.type === StatusType.CANCELLED;
+
+                        if (!isClosed) {
+                            const pendingPlannerId = this.pendingLinks.get(newTask.descriptionWithoutTags.trim());
+                            if (pendingPlannerId) {
+                                this.pendingLinks.delete(newTask.descriptionWithoutTags.trim());
+                                await this.linkExistingPlannerTask(id, pendingPlannerId);
+                            } else {
+                                await this.pushCreate(id, newTask);
+                            }
                         }
                     }
                 }
